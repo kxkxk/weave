@@ -1,0 +1,9 @@
+services:
+  weave:
+    build: .
+    platform: linux/amd64
+    ports: ["127.0.0.1:4318:4318"]
+    env_file: .env
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes: ["./data:/app/data"]
+    restart: unless-stopped

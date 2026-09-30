@@ -1,0 +1,56 @@
+import { EventEmitter } from 'node:events';
+import { defaults,envelope,id,type Model,type Trace,type Observation } from './contracts.js';
+import {Repository} from '../storage/repository.js';
+import {Dispatcher} from './dispatcher.js';
+import {Memory} from '../agents/memory.js';
+import {Drive} from '../agents/drive.js';
+import {Thinking} from '../agents/thinking.js';
+import {Behavior} from '../agents/behavior.js';
+import {PerceptionZone} from '../agents/perception.js';
+export interface Capture {capture(target:string,requestId:string):Promise<{observation:Observation;image:string}>}
+export class Engine extends EventEmitter {
+ readonly memory:Memory;readonly drive:Drive;readonly thinking:Thinking;readonly behavior:Behavior;readonly perception:PerceptionZone;readonly dispatcher=new Dispatcher();
+ private backgroundRunning=false;private timer?:NodeJS.Timeout;readonly clients=new Map<string,boolean>();
+ constructor(readonly repo:Repository,model:Model,private capture?:Capture,readonly now=()=>Date.now()){super();this.memory=new Memory(repo,model);this.drive=new Drive(repo,model);this.thinking=new Thinking(model);this.behavior=new Behavior(model);this.perception=new PerceptionZone(model);}
+ trace(background:boolean):Trace{return {id:id('trace'),revision:this.repo.state().context_revision,background,calls:0,thinkRounds:0,screenshots:0,revisions:0,deadline:this.now()+110000}}
+ private async zone<T>(name:string,type:string,payload:unknown,trace:Trace,fn:()=>Promise<T>):Promise<T>{const reply=await this.dispatcher.zones[name].request(envelope(type,payload,trace.revision,trace.id),()=>fn(),trace.background?0:1);return reply.value}
+ visible(){return [...this.clients.values()].some(Boolean)}
+ client(clientId:string,visible:boolean|null){const before=this.visible();if(visible===null)this.clients.delete(clientId);else this.clients.set(clientId,visible);const s=this.repo.state();if(!before&&this.visible()&&this.repo.persona()){if(!s.last_proactive_commit_at&&!s.last_user_message_at)this.repo.patch({next_review_at:this.now()+defaults.initialDelay,bootstrap_deadline:this.now()+120000});else if(s.next_review_at<this.now())this.repo.patch({next_review_at:this.now()+1000})}}
+ start(){this.timer=setInterval(()=>void this.tick(),1000);this.timer.unref();if(this.repo.state().pending_user_id)void this.resumePending()}
+ stop(){if(this.timer)clearInterval(this.timer)}
+ status(){return {phase:this.repo.persona()?'READY':'PERSONA_SETUP',...this.repo.state(),visible:this.visible(),background_running:this.backgroundRunning}}
+ control(patch:{autonomy_enabled?:boolean;pause_until?:number;screen_enabled?:boolean}){const s=this.repo.state();this.repo.patch({...patch,context_revision:s.context_revision+1,next_review_at:Math.max(this.now()+defaults.initialDelay,s.last_proactive_commit_at? s.last_proactive_commit_at+defaults.backoff[Math.min(2,s.unanswered_count)]:0)});this.emit('status',this.status())}
+ async user(text:string,clientId:string){if(!this.repo.persona())throw Error('PERSONA_REQUIRED');const result=this.repo.userMessage(text,clientId,this.now());if(result.fresh){this.emit('messages');void this.react(String(result.message.id),text)}return result.message}
+ private async resumePending(){const mid=this.repo.state().pending_user_id;const message=this.repo.db.prepare('SELECT text FROM conversation_messages WHERE id=?').get(mid!);if(message)await this.react(mid!,String(message.text))}
+ private async react(mid:string,text:string){const trace=this.trace(false);const obs:Observation={event_id:mid,source:'user_chat',occurred_at:this.now(),task_id:trace.id,content:text,evidence_ids:[mid]};try{await this.process([obs],null,trace)}catch(e){this.failure(e,trace)}}
+ async tick(){if(this.backgroundRunning)return;const now=this.now();const state=this.repo.state();if(state.bootstrap_deadline&&now>state.bootstrap_deadline&&!state.last_proactive_commit_at&&!state.bootstrap_failed){this.repo.patch({bootstrap_failed:true});this.emit('status',this.status())}if(!this.drive.eligible(now,this.visible()))return;this.backgroundRunning=true;const trace=this.trace(true);try{this.drive.noResponse(now);await this.autonomous(trace)}catch(e){this.failure(e,trace)}finally{this.backgroundRunning=false;this.emit('status',this.status())}}
+ private assertCurrent(trace:Trace){if(this.repo.state().context_revision!==trace.revision)throw Error('STALE_CONTEXT')}
+ private async autonomous(trace:Trace,feedback?:unknown):Promise<void>{const memory=await this.zone('memory','MEMORY_QUERY','主动交流',trace,()=>this.memory.recall('人格兴趣 用户明确偏好 未解决问题',trace));this.assertCurrent(trace);const decision=await this.zone('drive','MEMORY_REPLY',memory,trace,()=>this.drive.decide(memory,trace,feedback));this.assertCurrent(trace);if(decision.intent==='WAIT'){this.drive.feedback(decision.reason,this.now(),decision.review_after_seconds*1000);return}let topic;try{topic=this.drive.select(decision,this.now())}catch(e){if(trace.revisions++<1)return this.autonomous(trace,{reason:'重复候选',decision});throw e}const task={...decision,topic_id:topic?.topic_id??null,source:'self',deadline_at:trace.deadline};const outcome=await this.process([],task,trace);if(outcome==='NOOP'&&trace.revisions++<1&&trace.thinkRounds<2&&trace.calls+4<=defaults.maxCalls)await this.autonomous(trace,{reason:'上个候选行为区选择 NOOP，请提供不同方向'})}
+ private async process(inputs:Observation[],task:any,trace:Trace,images:string[]=[]):Promise<string>{
+  this.assertCurrent(trace);
+  for(const obs of inputs)this.repo.record({id:obs.event_id,kind:'OBSERVATION',source:obs.source,content:obs.content,evidence_ids:obs.evidence_ids,occurred_at:obs.occurred_at,artifact_id:obs.artifact_id});
+  const perception=inputs.length?await this.zone('perception','OBSERVATION',inputs,trace,()=>this.perception.perceive(inputs,trace,images)):null;
+  const memory=await this.zone('memory','MEMORY_QUERY',inputs,trace,()=>this.memory.recall(inputs.map(o=>o.content).join(' ')||task.question,trace));
+  this.assertCurrent(trace);
+  const topicId=task?.topic_id??this.repo.state().current_topic_id;
+  const think=await this.zone('thinking',task?'DRIVE_TASK':'PERCEPTION_RESULT',perception??task,trace,()=>this.thinking.run({persona:this.repo.persona(),perception,task,memory,recent_messages:this.repo.recentMessages(),screen_enabled:this.repo.state().screen_enabled},trace,images));
+  this.assertCurrent(trace);
+  const allowed=new Set([...inputs.flatMap(o=>o.evidence_ids),...memory.records.map((m:any)=>m.id)]);
+  if(think.observations.some(o=>o.evidence_ids.some(e=>!allowed.has(e))))throw Error('UNKNOWN_EVIDENCE');
+  for(const candidate of think.memory_candidates){if(candidate.evidence_ids.some(e=>!allowed.has(e)))throw Error('UNKNOWN_EVIDENCE');if(candidate.kind==='PREFERENCE'&&!inputs.some(o=>o.source==='user_chat'&&candidate.evidence_ids.includes(o.event_id)))continue;const event=this.repo.record({...candidate,source:candidate.kind==='PREFERENCE'?'user_explicit':'thinking',topic_id:topicId});if(candidate.kind==='PREFERENCE')this.repo.putLong({id:id('memory'),kind:'PREFERENCE',content:event.content,source_event_ids:[event.id,...event.evidence_ids],occurred_at:event.occurred_at,detail_level:'detailed',original_available:true,tags:[]})}
+  // Only a real user observation grants authority to alter controls.
+  if(!trace.background&&inputs.some(o=>o.source==='user_chat')){const control=think.user_control;const s=this.repo.state();if(control.autonomy!=='unchanged'){this.control(control.autonomy==='resume'?{autonomy_enabled:true,pause_until:0}:control.autonomy==='disable'?{autonomy_enabled:false}:{pause_until:this.now()+Math.max(60,control.pause_seconds)*1000});trace.revision=this.repo.state().context_revision}if(control.reject_current_topic&&s.current_topic_id){const topic=this.repo.topics().find(t=>t.topic_id===s.current_topic_id);if(topic)this.repo.putTopic({...topic,status:'CLOSED',revision:topic.revision+1});this.repo.patch({current_topic_id:null,context_revision:this.repo.state().context_revision+1});trace.revision=this.repo.state().context_revision}}
+  const state=this.repo.state();const decision=await this.zone('behavior','THINK_RESULT',think,trace,()=>this.behavior.run({persona:this.repo.persona(),think,mode:trace.background?'proactive':'reactive',topic_id:state.current_topic_id,recent_messages:this.repo.recentMessages(),state,capabilities:{speak:true,capture_screen:state.screen_enabled&&trace.screenshots===0&&Boolean(this.capture)},visible:this.visible()},trace));
+  this.assertCurrent(trace);const actionId=id('action');
+  if(decision.action==='NOOP'){this.repo.result(actionId,{status:'NOOP_RECORDED',...decision});this.drive.feedback(`${decision.reason}; ${decision.revisit_condition}`,this.now());return 'NOOP'}
+  if(decision.action==='SPEAK'){
+   if(decision.arguments.mode!==(trace.background?'proactive':'reactive'))throw Error('INVALID_MODE');
+   const current=this.repo.state();if(trace.background&&(!current.autonomy_enabled||current.pause_until>this.now()||!this.visible()))throw Error('PROACTIVE_NOT_ALLOWED');
+   if(this.repo.recentMessages().some(m=>m.role==='assistant'&&m.text===decision.arguments.text)){this.drive.feedback('重复表达，需更换角度',this.now());return 'NOOP'}
+   const result=this.repo.commit(actionId,decision.arguments.text,decision.arguments.mode,current.current_topic_id,trace.revision,this.now());this.repo.record({id:`result:${actionId}`,kind:'ACTION_RESULT',source:'conversation_executor',content:JSON.stringify(result),evidence_ids:[result.conversation_message_id]});this.emit('messages');return 'COMMITTED';
+  }
+  if(!this.capture||!this.repo.state().screen_enabled||trace.screenshots++>=1)throw Error('CAPTURE_NOT_ALLOWED');
+  try{const captured=await this.capture.capture(decision.arguments.target,actionId);this.assertCurrent(trace);const result={status:'CAPTURED',artifact_id:captured.observation.artifact_id,captured_at:captured.observation.occurred_at,action_id:actionId};this.repo.result(actionId,result);this.repo.record({id:`result:${actionId}`,kind:'ACTION_RESULT',source:'capture_executor',content:JSON.stringify(result)});captured.observation.task_id=trace.id;return await this.process([...inputs,captured.observation],task,trace,[captured.image])}catch(e){this.repo.result(actionId,{status:'FAILED',error_code:e instanceof Error?e.message:'CAPTURE_FAILED'});this.repo.record({id:`failed:${actionId}`,kind:'ACTION_RESULT',source:'capture_executor',content:'CAPTURE_FAILED'});throw e}
+ }
+ private failure(e:unknown,trace:Trace){const code=e instanceof Error?e.message:'UNKNOWN_ERROR';if(code==='STALE_CONTEXT')return;this.repo.patch({last_error:code,next_review_at:this.now()+60000});this.emit('status',this.status());this.emit('diagnostic',{trace_id:trace.id,error:code})}
+}
