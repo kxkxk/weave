@@ -34,6 +34,9 @@ export class Repository {
  touch(ids:string[]){for(const eid of new Set(ids))this.db.prepare("UPDATE memory_events SET access_seq=? WHERE id=? AND tier='HOT'").run(this.nextSeq(),eid)}
  putLong(data:any){this.db.prepare('INSERT OR REPLACE INTO long_term_memories VALUES(?,?,?,1,?)').run(data.id,data.kind,data.content,JSON.stringify(data))}
  long(idValue?:string):any[]{return this.db.prepare(`SELECT data FROM long_term_memories WHERE active=1 ${idValue?'AND id=?':''}`).all(...(idValue?[idValue]:[])).map(r=>JSON.parse(r.data as string))}
+ seeds():any[]{return this.db.prepare("SELECT data FROM long_term_memories WHERE active=1 AND kind='PERSONA_SEED'").all().map(r=>JSON.parse(r.data as string))}
+ preferences():any[]{return this.db.prepare("SELECT data FROM long_term_memories WHERE active=1 AND kind='PREFERENCE' ORDER BY rowid DESC LIMIT 20").all().map(r=>JSON.parse(r.data as string))}
+ isPinned(eventId:string){return Boolean(this.db.prepare("SELECT m.id FROM long_term_memories m, json_each(m.data,'$.source_event_ids') refs WHERE m.active=1 AND refs.value=? LIMIT 1").get(eventId))}
  candidates(query:string,limit=20):any[]{// SQLite instr supports Chinese fragments, unlike English-only token boundaries.
  const parts=[...new Set(query.match(/[\p{L}\p{N}]{2,}/gu)??[])].flatMap(p=>/[\u3400-\u9fff]/.test(p)?[...Array(Math.max(1,p.length-1))].map((_,i)=>p.slice(i,i+2)):[p]).slice(0,40);
  const rank=parts.length?parts.map(()=>'(CASE WHEN instr(content,?)>0 THEN 1 ELSE 0 END)').join('+'):'0';
