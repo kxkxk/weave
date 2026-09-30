@@ -1,10 +1,187 @@
-import { DriveSchema,defaults,id,type Model,type Trace,type Topic } from '../runtime/contracts.js';
-import type {Repository} from '../storage/repository.js';
+import {
+  DriveSchema,
+  defaults,
+  id,
+  type Model,
+  type Trace,
+  type Topic,
+} from "../runtime/contracts.js";
+import type { Repository } from "../storage/repository.js";
 export class Drive {
- constructor(private repo:Repository,private model:Model){}
- eligible(now:number,visible:boolean){const s=this.repo.state();if(!this.repo.persona()||!s.autonomy_enabled||s.pause_until>now||!visible||s.pending_user_id)return false;if(now<s.next_review_at)return false;if(s.last_user_message_at&&now<s.last_user_message_at+defaults.idle)return false;if(s.last_proactive_commit_at&&now<s.last_proactive_commit_at+defaults.minGap)return false;const rows=this.repo.db.prepare("SELECT COUNT(*) AS n FROM conversation_messages WHERE role='assistant' AND mode='proactive' AND created_at>?").get(now-3600000);return Number(rows!.n)<defaults.hourlyMessages&&this.repo.modelCount(now-3600000)<defaults.backgroundCalls}
- async decide(memory:unknown,trace:Trace,feedback?:unknown){return this.model.call('drive',{persona:this.repo.persona(),state:this.repo.state(),recent_topics:this.repo.topics(),memory,feedback},DriveSchema,trace)}
- select(decision:any,now:number):Topic|null{if(decision.intent==='WAIT')return null;const c=decision.candidates[decision.selected_index??0];if(!c)return this.repo.topics().find(t=>t.topic_id===this.repo.state().current_topic_id)??null;const duplicate=this.repo.topics().find(t=>t.topic_key===c.topic_key&&t.angle===c.angle&&(t.expires_at>now||t.status==='CLOSED'));if(duplicate)throw Error('DUPLICATE_TOPIC');const t:Topic={...c,topic_id:id('topic'),origin:'self',status:'SELECTED',revision:1,expires_at:now+c.ttl_seconds*1000,retry_after:0,last_offered_at:null,last_engaged_at:null};this.repo.putTopic(t);this.repo.patch({current_topic_id:t.topic_id});return t}
- noResponse(now:number){const s=this.repo.state();const last=this.repo.db.prepare("SELECT id,created_at,topic_id FROM conversation_messages WHERE role='assistant' AND mode='proactive' ORDER BY seq DESC LIMIT 1").get();if(!last||Number(last.created_at)<=s.last_user_message_at||last.id===s.last_no_response_evaluated_message_id)return;if(now<Number(last.created_at)+defaults.backoff[Math.min(s.unanswered_count,2)])return;this.repo.transaction(()=>{this.repo.patch({unanswered_count:s.unanswered_count+1,last_no_response_evaluated_message_id:String(last.id)});this.repo.record({kind:'OBSERVATION',source:'clock',content:'NO_RESPONSE_WINDOW: 此时间窗口未收到用户回应；喜好未知',evidence_ids:[String(last.id)],occurred_at:now});const topic=this.repo.topics().find(t=>t.topic_id===last.topic_id);if(topic)this.repo.putTopic({...topic,status:'COOLDOWN',retry_after:now+defaults.backoff[Math.min(s.unanswered_count+1,2)]})})}
- feedback(reason:string,now:number,delay=60000){const s=this.repo.state();this.repo.patch({consecutive_no_progress:s.consecutive_no_progress+1,next_review_at:now+Math.max(delay,Math.min(3600000,60000*2**Math.min(s.consecutive_no_progress,6)))});this.repo.record({kind:'INTENTION',source:'behavior',content:reason})}
+  constructor(
+    private repo: Repository,
+    private model: Model,
+  ) {}
+  eligible(now: number, visible: boolean) {
+    const s = this.repo.state();
+    if (
+      !this.repo.persona() ||
+      !s.autonomy_enabled ||
+      s.pause_until > now ||
+      !visible ||
+      s.pending_user_id
+    )
+      return false;
+    if (now < s.next_review_at) return false;
+    if (s.last_user_message_at && now < s.last_user_message_at + defaults.idle)
+      return false;
+    if (
+      s.last_proactive_commit_at &&
+      now < s.last_proactive_commit_at + defaults.minGap
+    )
+      return false;
+    const rows = this.repo.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM conversation_messages WHERE role='assistant' AND mode='proactive' AND created_at>?",
+      )
+      .get(now - 3600000);
+    return (
+      Number(rows!.n) < defaults.hourlyMessages &&
+      this.repo.modelCount(now - 3600000) < defaults.backgroundCalls
+    );
+  }
+  async decide(memory: unknown, trace: Trace, feedback?: unknown) {
+    return this.model.call(
+      "drive",
+      {
+        persona: this.repo.persona(),
+        state: this.repo.state(),
+        recent_topics: this.repo.topics(),
+        memory,
+        feedback,
+      },
+      DriveSchema,
+      trace,
+    );
+  }
+  select(decision: any, now: number): Topic | null {
+    if (decision.intent === "WAIT") return null;
+    const c = decision.candidates[decision.selected_index ?? 0];
+    if (!c)
+      return (
+        this.repo
+          .topics()
+          .find((t) => t.topic_id === this.repo.state().current_topic_id) ??
+        null
+      );
+    const duplicate = this.repo
+      .topics()
+      .find(
+        (t) =>
+          t.topic_key === c.topic_key &&
+          t.angle === c.angle &&
+          (t.expires_at > now || t.status === "CLOSED"),
+      );
+    if (duplicate) throw Error("DUPLICATE_TOPIC");
+    const t: Topic = {
+      ...c,
+      topic_id: id("topic"),
+      origin: "self",
+      status: "SELECTED",
+      revision: 1,
+      expires_at: now + c.ttl_seconds * 1000,
+      retry_after: 0,
+      last_offered_at: null,
+      last_engaged_at: null,
+    };
+    this.repo.putTopic(t);
+    this.repo.patch({ current_topic_id: t.topic_id });
+    return t;
+  }
+  applyProposal(
+    proposal: { suggested_status: string; next_question: string },
+    reactive: boolean,
+    now: number,
+  ) {
+    const topic = this.repo
+      .topics()
+      .find((t) => t.topic_id === this.repo.state().current_topic_id);
+    if (!topic) return;
+    if (topic.expires_at < now) {
+      this.repo.putTopic({
+        ...topic,
+        status: "CLOSED",
+        revision: topic.revision + 1,
+      });
+      this.repo.patch({ current_topic_id: null });
+      return;
+    }
+    if (proposal.suggested_status === "UNCHANGED") return;
+    if (proposal.suggested_status === "ENGAGED" && !reactive) return;
+    this.repo.putTopic({
+      ...topic,
+      status: proposal.suggested_status,
+      revision: topic.revision + 1,
+      last_engaged_at: reactive ? now : topic.last_engaged_at,
+      retry_after:
+        proposal.suggested_status === "COOLDOWN"
+          ? now + 3600000
+          : topic.retry_after,
+    });
+    if (proposal.suggested_status === "CLOSED")
+      this.repo.patch({ current_topic_id: null });
+  }
+  noResponse(now: number) {
+    const s = this.repo.state();
+    const last = this.repo.db
+      .prepare(
+        "SELECT id,created_at,topic_id FROM conversation_messages WHERE role='assistant' AND mode='proactive' ORDER BY seq DESC LIMIT 1",
+      )
+      .get();
+    if (
+      !last ||
+      Number(last.created_at) <= s.last_user_message_at ||
+      last.id === s.last_no_response_evaluated_message_id
+    )
+      return;
+    if (
+      now <
+      Number(last.created_at) +
+        defaults.backoff[Math.min(s.unanswered_count, 2)]
+    )
+      return;
+    this.repo.transaction(() => {
+      this.repo.patch({
+        unanswered_count: s.unanswered_count + 1,
+        last_no_response_evaluated_message_id: String(last.id),
+      });
+      this.repo.record({
+        kind: "OBSERVATION",
+        source: "clock",
+        content: "NO_RESPONSE_WINDOW: 此时间窗口未收到用户回应；喜好未知",
+        evidence_ids: [String(last.id)],
+        occurred_at: now,
+      });
+      const topic = this.repo
+        .topics()
+        .find((t) => t.topic_id === last.topic_id);
+      if (topic)
+        this.repo.putTopic({
+          ...topic,
+          status: "COOLDOWN",
+          retry_after:
+            now + defaults.backoff[Math.min(s.unanswered_count + 1, 2)],
+        });
+    });
+  }
+  feedback(reason: string, now: number, delay = 60000) {
+    const s = this.repo.state();
+    this.repo.patch({
+      consecutive_no_progress: s.consecutive_no_progress + 1,
+      next_review_at:
+        now +
+        Math.max(
+          delay,
+          Math.min(
+            3600000,
+            60000 * 2 ** Math.min(s.consecutive_no_progress, 6),
+          ),
+        ),
+    });
+    this.repo.record({
+      kind: "INTENTION",
+      source: "behavior",
+      content: reason,
+    });
+  }
 }
