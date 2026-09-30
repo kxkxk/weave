@@ -1,0 +1,46 @@
+[
+  {
+    "file": "01-five-zone-flows",
+    "nodes": 23,
+    "edges": 18,
+    "edge_crossings": 0,
+    "edge_overlaps": 0,
+    "unrelated_node_crossings": 0,
+    "label_crossings": 0,
+    "label_overflows": 0,
+    "style": "paper modules with low-saturation fills and thin routed arrows"
+  },
+  {
+    "file": "02-persona-startup",
+    "nodes": 12,
+    "edges": 6,
+    "edge_crossings": 0,
+    "edge_overlaps": 0,
+    "unrelated_node_crossings": 0,
+    "label_crossings": 0,
+    "label_overflows": 0,
+    "style": "paper modules with low-saturation fills and thin routed arrows"
+  },
+  {
+    "file": "03-topic-transitions",
+    "nodes": 16,
+    "edges": 9,
+    "edge_crossings": 0,
+    "edge_overlaps": 0,
+    "unrelated_node_crossings": 0,
+    "label_crossings": 0,
+    "label_overflows": 0,
+    "style": "paper modules with low-saturation fills and thin routed arrows"
+  },
+  {
+    "file": "04-autonomous-opening",
+    "nodes": 15,
+    "edges": 11,
+    "edge_crossings": 0,
+    "edge_overlaps": 0,
+    "unrelated_node_crossings": 0,
+    "label_crossings": 0,
+    "label_overflows": 0,
+    "style": "paper modules with low-saturation fills and thin routed arrows"
+  }
+]

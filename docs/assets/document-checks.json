@@ -1,0 +1,23 @@
+{
+  "document": "design-v1.md",
+  "document_sha256": "7e0f8f5ec135c1a752b11d472f7e205a8ff0adaf57a27bc2599862441c038c40",
+  "status": "PASS",
+  "sections": 15,
+  "requirements": 9,
+  "acceptance_cases": 21,
+  "structured_examples": {
+    "text": 18,
+    "yaml": 3,
+    "json": 3
+  },
+  "image_links": 4,
+  "rendered_diagrams_visually_inspected": 4,
+  "diagram_edges_checked": 44,
+  "edge_crossings": 0,
+  "edge_overlaps": 0,
+  "unrelated_node_crossings": 0,
+  "label_crossings": 0,
+  "label_overflows": 0,
+  "application_runtime_tests": "NOT_RUN",
+  "obsidian_application_preview": "NOT_RUN"
+}
